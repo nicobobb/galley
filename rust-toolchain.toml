@@ -1,0 +1,5 @@
+[toolchain]
+# Same toolchain Zed pins for the GPUI revision below.
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

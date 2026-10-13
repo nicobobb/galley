@@ -1,0 +1,24 @@
+[package]
+name = "review_syntax"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tree-sitter = "0.27.0"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-highlight = "0.27.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-language = "0.1.8"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+
+[lints]
+workspace = true

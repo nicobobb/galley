@@ -1,0 +1,16 @@
+[package]
+name = "review_search"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.33"
+nucleo-matcher = "0.3.1"
+
+[lints]
+workspace = true

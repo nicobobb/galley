@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/review_agent",
+    "crates/review_git",
+    "crates/review_search",
+    "crates/review_syntax",
+    "crates/review_app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+review_agent = { path = "crates/review_agent" }
+review_git = { path = "crates/review_git" }
+review_search = { path = "crates/review_search" }
+review_syntax = { path = "crates/review_syntax" }
+
+# GPUI is pre-1.0 and breaks often: pin an exact Zed commit and bump deliberately.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "204362325cb2dc15b368d6f13efc5a7b8ecc0122" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "204362325cb2dc15b368d6f13efc5a7b8ecc0122" }
+# Zed's component library (scrollbars, etc.) and the theme its components read colors from.
+theme = { git = "https://github.com/zed-industries/zed", rev = "204362325cb2dc15b368d6f13efc5a7b8ecc0122" }
+ui = { git = "https://github.com/zed-industries/zed", rev = "204362325cb2dc15b368d6f13efc5a7b8ecc0122" }
+
+anyhow = "1"
+
+# Zed's workspace patches don't propagate to dependents; mirror the ones GPUI relies on.
+[patch.crates-io]
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+# Keep our crates debuggable but make GPUI and friends fast enough to scroll smoothly.
+[profile.dev.package."*"]
+opt-level = 2
+
+[workspace.lints.rust]
+# MSVC's link.exe prints localized "creating library" noise for every binary.
+linker_messages = "allow"
