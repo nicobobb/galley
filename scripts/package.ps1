@@ -18,6 +18,7 @@ try {
 
     Copy-Item (Join-Path $root 'target\release\galley.exe') $staging
     Copy-Item (Join-Path $root 'packaging\*') $staging
+    Copy-Item (Join-Path $root 'LICENSE') (Join-Path $staging 'LICENSE.txt')
     Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -Force
     Remove-Item $staging -Recurse -Force
 

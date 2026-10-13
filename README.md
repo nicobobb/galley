@@ -141,6 +141,11 @@ C++ Redistributable.
 ### Releases
 
 `scripts/package.ps1` builds `dist\galley-<version>-windows-x64.zip` with the executable, the
-install scripts and a short `README.txt`. To publish a release, bump the version in `Cargo.toml`
+install scripts, a short `README.txt` and the license. To publish a release, bump the version in `Cargo.toml`
 and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`); CI builds the zip and
 creates the GitHub release.
+
+## License
+
+Galley is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE).
+It builds on Zed's `ui` and `theme` crates, which are GPL-3.0-or-later themselves.
