@@ -20,6 +20,8 @@ const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct Review {
     pub repo_root: PathBuf,
+    /// The checked out branch, or `detached at <id>` when `HEAD` points at a commit.
+    pub head_label: Option<String>,
     /// Human readable description of what the working tree is compared against.
     pub base_label: String,
     pub files: Vec<FileDiff>,
@@ -181,10 +183,29 @@ pub fn load_review(path: &Path, base: Option<&str>) -> Result<Review> {
     }
 
     Ok(Review {
+        head_label: head_label(&repo),
         repo_root,
         base_label,
         files,
     })
+}
+
+/// Reads `HEAD` directly instead of through `repo.head()`, which fails on an unborn
+/// branch (a fresh repo still has one checked out).
+fn head_label(repo: &Repository) -> Option<String> {
+    let head = repo.find_reference("HEAD").ok()?;
+    // Errors only for a branch name that isn't valid UTF-8.
+    match head.symbolic_target().ok()? {
+        Some(target) => Some(
+            target
+                .strip_prefix("refs/heads/")
+                .unwrap_or(target)
+                .to_string(),
+        ),
+        None => head
+            .target()
+            .map(|oid| format!("detached at {}", short_id(oid))),
+    }
 }
 
 /// For each path with uncommitted changes: (has staged changes, has unstaged changes).
@@ -396,6 +417,28 @@ mod tests {
         );
         assert!(main.old_text.as_deref().unwrap().contains("a();"));
         assert!(main.new_text.as_deref().unwrap().contains("b();"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn labels_branch_unborn_branch_and_detached_head() {
+        let dir = std::env::temp_dir().join(format!("review_git_head_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        repo.set_head("refs/heads/feature/x").unwrap();
+
+        let label = || load_review(&dir, None).unwrap().head_label;
+        assert_eq!(label().as_deref(), Some("feature/x"));
+
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        commit_all(&repo, "initial");
+        assert_eq!(label().as_deref(), Some("feature/x"));
+
+        let id = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(id).unwrap();
+        assert_eq!(label(), Some(format!("detached at {}", short_id(id))));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

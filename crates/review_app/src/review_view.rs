@@ -869,6 +869,9 @@ impl ReviewView {
             .unwrap_or_default();
         header = header.child(div().font_weight(FontWeight::SEMIBOLD).child(repo_name));
         if let Some(review) = self.review() {
+            if let Some(head_label) = &review.head_label {
+                header = header.child(div().text_color(theme::accent()).child(head_label.clone()));
+            }
             let additions: usize = review.files.iter().map(|file| file.additions).sum();
             let deletions: usize = review.files.iter().map(|file| file.deletions).sum();
             header = header
