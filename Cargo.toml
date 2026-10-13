@@ -5,6 +5,7 @@ members = [
     "crates/review_git",
     "crates/review_search",
     "crates/review_syntax",
+    "crates/review_update",
     "crates/review_app",
 ]
 
@@ -19,6 +20,7 @@ review_agent = { path = "crates/review_agent" }
 review_git = { path = "crates/review_git" }
 review_search = { path = "crates/review_search" }
 review_syntax = { path = "crates/review_syntax" }
+review_update = { path = "crates/review_update" }
 
 # GPUI is pre-1.0 and breaks often: pin an exact Zed commit and bump deliberately.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "204362325cb2dc15b368d6f13efc5a7b8ecc0122" }

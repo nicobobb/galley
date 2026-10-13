@@ -54,4 +54,5 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create '${{ github.ref_name }}' (Get-Item dist\*.zip) --generate-notes
+        # Installed copies update from galley-windows-x64.exe, checked against SHA256SUMS.
+        run: gh release create '${{ github.ref_name }}' (Get-Item dist\*.zip, dist\galley-windows-x64.exe, dist\SHA256SUMS) --generate-notes

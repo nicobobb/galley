@@ -43,6 +43,12 @@ double-click `install.cmd`, and open a new terminal. The installer copies `galle
 The executable isn't code-signed, so Windows SmartScreen may ask for confirmation
 ("More info" → "Run anyway").
 
+Once installed this way, Galley checks GitHub for a newer release when it starts (and every few
+hours while open). When there is one, the header shows **Update**: it downloads the new
+`galley.exe`, verifies it against the release's `SHA256SUMS`, swaps it in, and offers **Restart**.
+Nothing is installed without that click. To turn the check off, add `"check_for_updates": false`
+to `%APPDATA%\galley\settings.json`. Builds installed from source are never touched.
+
 ### From source
 
 With [rustup](https://rustup.rs) installed (the pinned toolchain is picked up automatically):
@@ -122,6 +128,7 @@ The workspace is split into UI-free library crates and the app:
 | `review_git` | Loads diffs with `git2` (files, hunks, lines, full contents of both sides), watches the repository, and stages/commits through the `git` CLI. |
 | `review_search` | Lists files respecting `.gitignore`, fuzzy matching (`nucleo`) and text search (`grep-*`). |
 | `review_syntax` | tree-sitter highlighting, split per line. |
+| `review_update` | Checks GitHub releases for a newer version and swaps in its verified `galley.exe`. |
 | `review_app` | The `galley` binary: the GPUI interface. |
 
 Before sending changes, run the same checks as CI:
@@ -141,9 +148,10 @@ C++ Redistributable.
 ### Releases
 
 `scripts/package.ps1` builds `dist\galley-<version>-windows-x64.zip` with the executable, the
-install scripts, a short `README.txt` and the license. To publish a release, bump the version in `Cargo.toml`
-and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`); CI builds the zip and
-creates the GitHub release.
+install scripts, a short `README.txt` and the license, plus `galley-windows-x64.exe` and
+`SHA256SUMS`, which installed copies use to update themselves. To publish a release, bump the
+version in `Cargo.toml` and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`); CI
+builds all three and creates the GitHub release.
 
 ## License
 

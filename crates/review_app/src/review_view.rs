@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use gpui::{
@@ -10,8 +11,10 @@ use gpui::{
     ListHorizontalSizingBehavior, ScrollStrategy, SharedString, StyledText, Subscription, Task,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
+use review_agent::permissions::CommandSettings;
 use review_git::{FileDiff, LineKind, RepoWatcher, Review, StageState};
 use review_syntax::HighlightedLine;
+use review_update::Release;
 use ui::WithScrollbar as _;
 
 use crate::agent_panel::{AgentPanel, AgentPanelEvent, Side, ThreadAnchor};
@@ -26,6 +29,22 @@ use crate::{
 
 /// Files bigger than this aren't opened in the file view.
 const MAX_OPEN_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Galley tends to stay open for days, so it checks again now and then.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Progress of updating Galley to a newer release, shown in the header.
+enum UpdateState {
+    /// Up to date, or the check failed (offline, rate limited): nothing to show.
+    None,
+    Available(Release),
+    Installing(SharedString),
+    /// The new executable is in place; it runs from the next start.
+    Installed(SharedString),
+    Failed(Release, SharedString),
+    /// Installed, but launching it failed; reopening Galley by hand picks it up.
+    RestartFailed(SharedString),
+}
 
 enum LoadState {
     Loading,
@@ -120,6 +139,11 @@ pub struct ReviewView {
     watcher: Option<(PathBuf, RepoWatcher, Task<()>)>,
     /// Why the repository can't be watched, shown so the user knows to reload by hand.
     watcher_error: Option<String>,
+    /// The executable updates replace; `None` unless installed by `install.ps1`.
+    installed_exe: Option<PathBuf>,
+    update: UpdateState,
+    update_check_task: Option<Task<()>>,
+    update_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -176,10 +200,93 @@ impl ReviewView {
             highlight_task: None,
             watcher: None,
             watcher_error: None,
+            installed_exe: review_update::installed_exe(),
+            update: UpdateState::None,
+            update_check_task: None,
+            update_task: None,
             _subscriptions: subscriptions,
         };
         this.reload(cx);
+        this.check_for_updates(cx);
         this
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        let Some(exe) = &self.installed_exe else {
+            return;
+        };
+        review_update::remove_old_exe(exe);
+        if !CommandSettings::existing_path()
+            .as_deref()
+            .is_none_or(review_update::enabled_in)
+        {
+            return;
+        }
+        self.update_check_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let result = cx.background_spawn(async { review_update::check() }).await;
+                let updated = this.update(cx, |this, cx| {
+                    // A newer release replaces one found earlier, but never interrupts
+                    // an install or hides its result.
+                    if let (Ok(Some(release)), UpdateState::None | UpdateState::Available(_)) =
+                        (result, &this.update)
+                    {
+                        this.update = UpdateState::Available(release);
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(UPDATE_CHECK_INTERVAL).await;
+            }
+        }));
+    }
+
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let (UpdateState::Available(release) | UpdateState::Failed(release, _)) = &self.update
+        else {
+            return;
+        };
+        let Some(exe) = self.installed_exe.clone() else {
+            return;
+        };
+        let release = release.clone();
+        let version: SharedString = release.version.to_string().into();
+        self.update = UpdateState::Installing(version.clone());
+        cx.notify();
+        let install = cx.background_spawn({
+            let release = release.clone();
+            async move { review_update::install(&release, &exe) }
+        });
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let result = install.await;
+            this.update(cx, |this, cx| {
+                this.update = match result {
+                    Ok(()) => UpdateState::Installed(version),
+                    Err(error) => UpdateState::Failed(release, format!("{error:#}").into()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Starts the new version with the same arguments and closes this one.
+    fn restart(&mut self, cx: &mut Context<Self>) {
+        let Some(exe) = &self.installed_exe else {
+            return;
+        };
+        match std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .spawn()
+        {
+            Ok(_) => cx.quit(),
+            Err(error) => {
+                self.update = UpdateState::RestartFailed(format!("{error}").into());
+                cx.notify();
+            }
+        }
     }
 
     fn review(&self) -> Option<&Review> {
@@ -847,7 +954,7 @@ impl ReviewView {
         self.apply_pending_lines();
     }
 
-    fn render_header(&self) -> impl IntoElement {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut header = div()
             .h(px(36.))
             .flex_none()
@@ -906,10 +1013,73 @@ impl ReviewView {
         } else {
             header = header.child(div().flex_1());
         }
-        header.child(
+        header.children(self.render_update(cx)).child(
             div()
                 .text_color(theme::muted())
                 .child("Ctrl+P file · Ctrl+Shift+F search · Alt+T thread · Alt+A agent"),
+        )
+    }
+
+    fn render_update(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_2()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(theme::accent_background())
+                .hover(|style| style.bg(theme::selection()))
+                .child(label)
+        };
+        let (message, color, action) = match &self.update {
+            UpdateState::None => return None,
+            UpdateState::Available(release) => (
+                format!("Galley {} available", release.version),
+                theme::accent(),
+                Some(
+                    button("install-update", "Update")
+                        .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
+                ),
+            ),
+            UpdateState::Installing(version) => {
+                (format!("Updating to {version}…"), theme::muted(), None)
+            }
+            UpdateState::Installed(version) => (
+                format!("Galley {version} installed"),
+                theme::accent(),
+                Some(
+                    button("restart", "Restart")
+                        .on_click(cx.listener(|this, _, _, cx| this.restart(cx))),
+                ),
+            ),
+            UpdateState::Failed(_, error) => (
+                format!("Update failed: {error}"),
+                theme::warning(),
+                Some(
+                    button("retry-update", "Retry")
+                        .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
+                ),
+            ),
+            UpdateState::RestartFailed(error) => (
+                format!("Updated, but couldn't restart ({error}); reopen Galley"),
+                theme::warning(),
+                None,
+            ),
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .max_w(px(420.))
+                        .truncate()
+                        .text_color(color)
+                        .child(message),
+                )
+                .children(action)
+                .into_any_element(),
         )
     }
 
@@ -1539,7 +1709,7 @@ impl Render for ReviewView {
             .text_color(theme::text())
             .font_family(theme::UI_FONT)
             .text_size(theme::UI_TEXT_SIZE)
-            .child(self.render_header())
+            .child(self.render_header(cx))
             .child(body)
             .when_some(self.search_modal.as_ref(), |root, (modal, _)| {
                 root.child(

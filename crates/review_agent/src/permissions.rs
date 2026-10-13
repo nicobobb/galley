@@ -63,6 +63,10 @@ pub fn suggest_prefix(command: &str) -> String {
 pub struct CommandSettings {
     #[serde(default)]
     allowed_commands: BTreeMap<String, Vec<String>>,
+    /// Settings owned by other parts of Galley (e.g. `check_for_updates`), kept as is
+    /// so saving the allowlist doesn't drop them.
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl CommandSettings {
@@ -220,6 +224,19 @@ mod tests {
         assert!(settings.allowed(Path::new("C:/Repos/Other")).is_empty());
         settings.disallow(repo, "cargo test");
         assert_eq!(settings.allowed(repo), ["cargo check"]);
+
+        // Keys this struct doesn't know survive a load/save round trip.
+        std::fs::write(
+            &path,
+            r#"{"allowed_commands": {}, "check_for_updates": false}"#,
+        )
+        .unwrap();
+        CommandSettings::load(&path).unwrap().save(&path).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""check_for_updates": false"#)
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

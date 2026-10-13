@@ -1,0 +1,18 @@
+[package]
+name = "review_update"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+semver = "1.0.28"
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+# Native TLS (Schannel on Windows) trusts the system certificate store, which corporate
+# networks that inspect TLS rely on.
+ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
+
+[lints]
+workspace = true
