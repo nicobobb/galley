@@ -131,7 +131,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Galley".into()),
+                    title: Some(concat!("Galley ", env!("CARGO_PKG_VERSION")).into()),
                     ..Default::default()
                 }),
                 ..Default::default()
