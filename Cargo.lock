@@ -4316,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "review_agent"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -4325,7 +4325,7 @@ dependencies = [
 
 [[package]]
 name = "review_app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -4345,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "review_git"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "git2",
@@ -4354,7 +4354,7 @@ dependencies = [
 
 [[package]]
 name = "review_github"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "review_git",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "review_search"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "grep-matcher",
@@ -4376,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "review_syntax"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tree-sitter",
@@ -4396,7 +4396,7 @@ dependencies = [
 
 [[package]]
 name = "review_update"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "semver",
