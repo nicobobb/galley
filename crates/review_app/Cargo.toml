@@ -16,6 +16,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 review_agent.workspace = true
 review_git.workspace = true
+review_github.workspace = true
 review_search.workspace = true
 review_syntax.workspace = true
 review_update.workspace = true

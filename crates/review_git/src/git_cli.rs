@@ -46,7 +46,37 @@ pub fn commit(repo_root: &Path, message: &str) -> Result<String> {
     Ok(format!("{} {subject}", hash.trim()))
 }
 
-fn git(repo_root: &Path, args: &[&str], stdin: Option<&str>) -> Result<String> {
+/// Staged changes as `git diff --cached` shows them, preceded by a `--stat` summary.
+pub fn staged_diff(repo_root: &Path) -> Result<String> {
+    let stat = git(
+        repo_root,
+        &["diff", "--cached", "--stat", "--no-color"],
+        None,
+    )?;
+    if stat.trim().is_empty() {
+        bail!("nothing is staged");
+    }
+    let patch = git(
+        repo_root,
+        &["diff", "--cached", "--no-color", "--no-ext-diff"],
+        None,
+    )?;
+    Ok(format!("{stat}\n{patch}"))
+}
+
+/// Subjects of the last `count` commits, newest first; empty before the first commit.
+pub fn recent_subjects(repo_root: &Path, count: usize) -> Vec<String> {
+    git(
+        repo_root,
+        &["log", &format!("-{count}"), "--no-merges", "--format=%s"],
+        None,
+    )
+    .map(|log| log.lines().map(str::to_string).collect())
+    .unwrap_or_default()
+}
+
+/// Runs `git -C repo_root <args>` and returns its stdout, or its error output.
+pub fn git(repo_root: &Path, args: &[&str], stdin: Option<&str>) -> Result<String> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -161,6 +191,7 @@ mod tests {
         unstage(&dir, &["a.txt"]).unwrap();
         assert_eq!(stage_of(&dir, "a.txt"), StageState::Unstaged);
 
+        assert!(staged_diff(&dir).is_err());
         let error = commit(&dir, "nothing").unwrap_err().to_string();
         assert!(!error.is_empty());
         assert!(commit(&dir, "  ").is_err());

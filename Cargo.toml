@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/review_agent",
     "crates/review_git",
+    "crates/review_github",
     "crates/review_search",
     "crates/review_syntax",
     "crates/review_update",
@@ -18,6 +19,7 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 review_agent = { path = "crates/review_agent" }
 review_git = { path = "crates/review_git" }
+review_github = { path = "crates/review_github" }
 review_search = { path = "crates/review_search" }
 review_syntax = { path = "crates/review_syntax" }
 review_update = { path = "crates/review_update" }

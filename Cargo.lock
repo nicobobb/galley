@@ -4333,6 +4333,7 @@ dependencies = [
  "gpui_platform",
  "review_agent",
  "review_git",
+ "review_github",
  "review_search",
  "review_syntax",
  "review_update",
@@ -4349,6 +4350,16 @@ dependencies = [
  "anyhow",
  "git2",
  "notify-debouncer-mini",
+]
+
+[[package]]
+name = "review_github"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "review_git",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

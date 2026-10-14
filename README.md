@@ -1,9 +1,10 @@
 # Galley
 
 A native desktop app for reviewing AI-written code before it ships. Galley shows your
-uncommitted changes (or a branch against its base) as a fast, syntax-highlighted diff, and lets
-you open review threads with [Claude Code](https://claude.com/claude-code) anchored to the exact
-lines you're looking at. Everything runs locally.
+uncommitted changes, a branch against its base or a GitHub pull request as a fast,
+syntax-highlighted diff, and lets you open review threads with
+[Claude Code](https://claude.com/claude-code) anchored to the exact lines you're looking at.
+Everything runs locally.
 
 Built in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the UI
 framework behind the Zed editor.
@@ -20,8 +21,12 @@ framework behind the Zed editor.
   continue the same session.
 - **Per-repository command allowlist**: the agent can't run shell commands unless you allow them,
   and denied commands can be approved from the thread with one click.
+- **GitHub pull requests**: open a PR by its URL in a worktree of its own, leave draft line
+  comments (`Alt+R`), submit them as a review (comment, approve or request changes), and push your
+  fixes to the PR's branch.
 - **Staging and committing**: per-file stage/unstage and commits through your system `git`, so
-  hooks, commit signing and repository config behave exactly as in a terminal.
+  hooks, commit signing and repository config behave exactly as in a terminal. Claude Code can
+  write the commit message from what's staged.
 - **Search**: fuzzy file finder (`Ctrl+P`) and repository-wide text search (`Ctrl+Shift+F`).
 
 ## Requirements
@@ -29,7 +34,9 @@ framework behind the Zed editor.
 - Windows 10 or 11, 64-bit. Galley is currently developed and released for Windows only.
 - [git](https://git-scm.com/download/win) on the `PATH`.
 - Optional: [Claude Code](https://claude.com/claude-code), installed and signed in, for review
-  threads. Everything else works without it.
+  threads and generated commit messages.
+- Optional: the [GitHub CLI](https://cli.github.com) (`gh`), signed in with `gh auth login`, for
+  pull requests. Everything else works without these two.
 
 ## Installation
 
@@ -63,7 +70,8 @@ This builds a release binary and puts `galley.exe` in `~/.cargo/bin`. Run the sa
 ## Usage
 
 ```sh
-galley [REPO_PATH] [--base REF]
+galley [REPO_PATH] [--base REF | --pr PR]
+galley PR_URL
 ```
 
 Without a path, Galley opens the repository in the current directory. The release build is a GUI
@@ -72,6 +80,8 @@ app, so the terminal is free as soon as the window opens.
 - Without `--base`: shows working tree changes (staged, unstaged and untracked) against `HEAD`.
 - With `--base main`: compares against the merge base with `main`, the way a pull request from the
   current branch would look.
+- With a pull request URL (`galley https://github.com/owner/repo/pull/123`), `owner/repo#123`, or
+  `--pr 123` for a PR of the repository you're in: reviews that pull request (see below).
 
 ### Keyboard shortcuts
 
@@ -85,6 +95,7 @@ app, so the terminal is free as soon as the window opens.
 | `Ctrl+Shift+F` | Search text in the repository (`Alt+R` toggles regex) |
 | Click / `Shift`+click in the diff | Select lines |
 | `Alt+T` | Open a Claude Code thread on the selected lines (or the whole file) |
+| `Alt+R` | Pull requests: write a draft review comment on the selected lines |
 | `Alt+A` | Show or hide the agent panel |
 | `Enter` / `Shift+Enter` | In the agent panel: send / new line |
 | `Esc` | In the agent panel: stop the agent |
@@ -118,14 +129,44 @@ Each file in the tree has a checkbox: empty (unstaged), checked (staged) or a da
 staged, with further changes in the working tree). The panel at the bottom of the sidebar stages or
 unstages everything and commits. All of it goes through your system `git`.
 
+**Generate message** asks Claude Code for a commit message describing the staged diff, in the
+style of the repository's recent commit subjects. It runs `claude -p` on the Haiku model with no
+tools, so it can only read what Galley sends it, and puts the result in the message box for you to
+edit before committing.
+
+## Pull requests
+
+`galley https://github.com/owner/repo/pull/123` checks the PR out and shows it against the merge
+base with its base branch, the same diff GitHub shows. Everything else works as usual: threads with
+Claude Code, staging and committing. GitHub is reached through `gh`, so private repositories and
+your account work as they do there.
+
+- **Where it's checked out**: in a worktree of its own, under `%LOCALAPPDATA%\galley\worktrees`,
+  so your own checkout is never touched. If you open the PR from a clone of its repository, the
+  worktree belongs to that clone; otherwise Galley keeps a clone in `%LOCALAPPDATA%\galley\repos`.
+  Opening the PR again reuses the worktree and moves it to the PR's latest commit, unless you have
+  uncommitted or unpushed work there.
+- **Draft comments**: select lines in the diff and press `Alt+R`. Drafts are listed in the
+  **Review** tab of the side panel, marked in yellow in the diff, and saved as you go, so closing
+  Galley doesn't lose them. They're only sent when you submit the review.
+- **Submitting**: write an optional summary and choose **Comment**, **Approve** or
+  **Request changes**. The drafts become line comments of that review.
+- **Pushing fixes**: commit your (or the agent's) edits in Galley and **Push** sends the commits
+  to the PR's branch, including a fork's when it allows edits from maintainers. It never
+  force-pushes. Pushing over HTTPS uses git's credentials; `gh auth setup-git` makes git use gh's.
+
+Line comments point at lines of your local version of the PR. Push your fixes before submitting,
+or the line numbers may not match what GitHub has.
+
 ## Development
 
 The workspace is split into UI-free library crates and the app:
 
 | Crate | Responsibility |
 |---|---|
-| `review_agent` | Runs Claude Code in `stream-json` mode and turns its output into typed events. |
+| `review_agent` | Runs Claude Code in `stream-json` mode and turns its output into typed events; also generates commit messages. |
 | `review_git` | Loads diffs with `git2` (files, hunks, lines, full contents of both sides), watches the repository, and stages/commits through the `git` CLI. |
+| `review_github` | Checks pull requests out into worktrees, pushes to their branches and submits reviews, through `gh` and `git`. |
 | `review_search` | Lists files respecting `.gitignore`, fuzzy matching (`nucleo`) and text search (`grep-*`). |
 | `review_syntax` | tree-sitter highlighting, split per line. |
 | `review_update` | Checks GitHub releases for a newer version and swaps in its verified `galley.exe`. |

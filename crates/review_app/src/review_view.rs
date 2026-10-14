@@ -8,24 +8,45 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use gpui::{
     AnyElement, ClickEvent, Context, Entity, FocusHandle, FontWeight, HighlightStyle,
-    ListHorizontalSizingBehavior, ScrollStrategy, SharedString, StyledText, Subscription, Task,
-    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    ListHorizontalSizingBehavior, Rgba, ScrollStrategy, SharedString, StyledText, Subscription,
+    Task, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use review_agent::permissions::CommandSettings;
 use review_git::{FileDiff, LineKind, RepoWatcher, Review, StageState};
+use review_github::{DiffSide, PrTarget};
 use review_syntax::HighlightedLine;
 use review_update::Release;
 use ui::WithScrollbar as _;
 
 use crate::agent_panel::{AgentPanel, AgentPanelEvent, Side, ThreadAnchor};
 use crate::file_tree::{FileTree, TreeEntry};
+use crate::pr_panel::{PrPanel, PrPanelEvent};
 use crate::search_modal::{SearchModal, SearchModalEvent, SearchMode};
 use crate::split_diff::{RowTag, SplitRow};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::{
-    NewThread, NextFile, OpenFileFinder, OpenTextSearch, PreviousFile, Reload, ToggleAgentPanel,
-    ToggleSplitDiff, ToggleStaged, theme,
+    NewDraftComment, NewThread, NextFile, OpenFileFinder, OpenTextSearch, PreviousFile, Reload,
+    ToggleAgentPanel, ToggleSplitDiff, ToggleStaged, theme,
 };
+
+/// What Galley was opened to review.
+pub enum Source {
+    /// A local repository's uncommitted changes, or its branch against `base`.
+    Local { path: PathBuf, base: Option<String> },
+    /// A GitHub pull request, checked out in a worktree of its own. `local_repo` is
+    /// where to look for an existing clone (and the repository a bare number refers to).
+    PullRequest {
+        target: PrTarget,
+        local_repo: PathBuf,
+    },
+}
+
+/// The panel shown to the right of the diff.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidePanel {
+    Agent,
+    Review,
+}
 
 /// Files bigger than this aren't opened in the file view.
 const MAX_OPEN_FILE_BYTES: usize = 4 * 1024 * 1024;
@@ -47,7 +68,7 @@ enum UpdateState {
 }
 
 enum LoadState {
-    Loading,
+    Loading(SharedString),
     Failed(SharedString),
     Loaded(Review),
 }
@@ -94,7 +115,21 @@ impl Row {
             _ => None,
         }
     }
+
+    /// Color of the first marker covering this row.
+    fn marker(&self, markers: &[LineMarker]) -> Option<Rgba> {
+        markers
+            .iter()
+            .find(|(side, start, end, _)| {
+                self.line_number(*side)
+                    .is_some_and(|n| (*start..=*end).contains(&n))
+            })
+            .map(|marker| marker.3)
+    }
 }
+
+/// An inclusive line range on one side and the color of its marker strip.
+type LineMarker = (Side, u32, u32, Rgba);
 
 pub struct ReviewView {
     focus_handle: FocusHandle,
@@ -128,11 +163,16 @@ pub struct ReviewView {
     file_scroll: UniformListScrollHandle,
     diff_scroll: UniformListScrollHandle,
     agent_panel: Entity<AgentPanel>,
-    show_agent_panel: bool,
+    /// Set once the pull request being reviewed is checked out.
+    pr_panel: Option<Entity<PrPanel>>,
+    /// Checks out the pull request; `repo_path` isn't the one to review until it's done.
+    pr_task: Option<Task<()>>,
+    side_panel: Option<SidePanel>,
     commit_input: Entity<TextInput>,
     /// Result of the last stage/unstage/commit: (is error, message).
     git_status: Option<(bool, SharedString)>,
     git_task: Option<Task<()>>,
+    commit_message_task: Option<Task<()>>,
     load_task: Option<Task<()>>,
     highlight_task: Option<Task<()>>,
     /// Reloads the review when files change on disk; `None` until the first load.
@@ -148,12 +188,11 @@ pub struct ReviewView {
 }
 
 impl ReviewView {
-    pub fn new(
-        repo_path: PathBuf,
-        base: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(source: Source, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (repo_path, base, pr_target) = match source {
+            Source::Local { path, base } => (path, base, None),
+            Source::PullRequest { target, local_repo } => (local_repo, None, Some(target)),
+        };
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let agent_panel = cx.new(AgentPanel::new);
@@ -172,7 +211,7 @@ impl ReviewView {
             focus_handle,
             repo_path,
             base,
-            state: LoadState::Loading,
+            state: LoadState::Loading("Loading changes…".into()),
             selected: 0,
             rows: Rc::default(),
             widest_row: None,
@@ -192,10 +231,13 @@ impl ReviewView {
             file_scroll: UniformListScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
             agent_panel,
-            show_agent_panel: false,
+            pr_panel: None,
+            pr_task: None,
+            side_panel: None,
             commit_input,
             git_status: None,
             git_task: None,
+            commit_message_task: None,
             load_task: None,
             highlight_task: None,
             watcher: None,
@@ -206,9 +248,69 @@ impl ReviewView {
             update_task: None,
             _subscriptions: subscriptions,
         };
-        this.reload(cx);
+        match pr_target {
+            Some(target) => this.check_out_pr(target, cx),
+            None => this.reload(cx),
+        }
         this.check_for_updates(cx);
         this
+    }
+
+    /// Checks out the pull request in the background, then reviews its worktree
+    /// against the merge base with the PR's base branch.
+    fn check_out_pr(&mut self, target: PrTarget, cx: &mut Context<Self>) {
+        let local_repo = self.repo_path.clone();
+        let (sender, mut progress) = futures::channel::mpsc::unbounded();
+        let checkout = cx.background_spawn(async move {
+            review_github::checkout(&target, &local_repo, &|message| {
+                sender.unbounded_send(message).ok();
+            })
+        });
+        self.state = LoadState::Loading("Loading the pull request…".into());
+        self.pr_task = Some(cx.spawn(async move |this, cx| {
+            // The channel closes when the checkout finishes and drops its sender.
+            while let Some(message) = progress.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.state = LoadState::Loading(message.into());
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+            let result = checkout.await;
+            this.update(cx, |this, cx| {
+                this.pr_task = None;
+                match result {
+                    Ok(checkout) => {
+                        this.repo_path = checkout.worktree.clone();
+                        this.base = Some(checkout.base_ref());
+                        let panel = cx.new(|cx| PrPanel::new(checkout, cx));
+                        this._subscriptions
+                            .push(cx.subscribe(&panel, Self::on_pr_panel_event));
+                        this.pr_panel = Some(panel);
+                        this.side_panel = Some(SidePanel::Review);
+                        this.reload(cx);
+                    }
+                    Err(error) => this.state = LoadState::Failed(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn on_pr_panel_event(
+        &mut self,
+        _: Entity<PrPanel>,
+        event: &PrPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PrPanelEvent::Reveal(anchor) => self.reveal(anchor, cx),
+            PrPanelEvent::DraftsChanged => cx.notify(),
+            PrPanelEvent::Pushed => self.reload(cx),
+        }
     }
 
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
@@ -309,13 +411,39 @@ impl ReviewView {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.pr_task.is_some() {
+            return;
+        }
         let path = self.repo_path.clone();
         let base = self.base.clone();
-        let load =
-            cx.background_spawn(async move { review_git::load_review(&path, base.as_deref()) });
+        let checkout = self
+            .pr_panel
+            .as_ref()
+            .map(|panel| panel.read(cx).checkout().clone());
+        let load = cx.background_spawn(async move {
+            let review = review_git::load_review(&path, base.as_deref());
+            let unpushed = checkout
+                .map(|checkout| review_github::unpushed_commits(&checkout).unwrap_or_default());
+            (review, unpushed)
+        });
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = load.await;
-            this.update(cx, |this, cx| this.set_review(result, cx)).ok();
+            let (result, unpushed) = load.await;
+            this.update(cx, |this, cx| {
+                this.set_review(result, cx);
+                if let (Some(panel), Some(unpushed)) = (this.pr_panel.clone(), unpushed) {
+                    let uncommitted = this.review().map_or(0, |review| {
+                        review
+                            .files
+                            .iter()
+                            .filter(|file| file.stage != StageState::Committed)
+                            .count()
+                    });
+                    panel.update(cx, |panel, cx| {
+                        panel.set_local_state(unpushed, uncommitted, cx)
+                    });
+                }
+            })
+            .ok();
         }));
     }
 
@@ -324,7 +452,14 @@ impl ReviewView {
         let previous_path = self.selected_file().map(|file| file.path.clone());
         self.highlights.clear();
         self.state = match result {
-            Ok(review) => {
+            Ok(mut review) => {
+                if let Some(panel) = &self.pr_panel {
+                    // Name the PR's base branch rather than Galley's ref for it.
+                    let checkout = panel.read(cx).checkout();
+                    review.base_label = review
+                        .base_label
+                        .replace(&checkout.base_ref(), &checkout.pull_request.base_branch);
+                }
                 let root = review.repo_root.clone();
                 self.agent_panel
                     .update(cx, |panel, _| panel.set_repo_root(root.clone()));
@@ -506,6 +641,38 @@ impl ReviewView {
             },
             cx,
         );
+    }
+
+    /// Asks Claude Code for a message describing what's staged and puts it in the box.
+    fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
+        if self.commit_message_task.is_some() {
+            return;
+        }
+        let Some(root) = self.review().map(|review| review.repo_root.clone()) else {
+            return;
+        };
+        let generate = cx.background_spawn(async move {
+            let diff = review_git::staged_diff(&root)?;
+            let subjects = review_git::recent_subjects(&root, 10);
+            let prompt = review_agent::commit_message_prompt(&diff, &subjects);
+            review_agent::generate_commit_message(&root, &prompt)
+        });
+        self.git_status = None;
+        self.commit_message_task = Some(cx.spawn(async move |this, cx| {
+            let result = generate.await;
+            this.update(cx, |this, cx| {
+                this.commit_message_task = None;
+                match result {
+                    Ok(message) => this
+                        .commit_input
+                        .update(cx, |input, cx| input.set_text(message, cx)),
+                    Err(error) => this.git_status = Some((true, format!("{error:#}").into())),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn toggle_split(&mut self, _: &ToggleSplitDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -744,10 +911,39 @@ impl ReviewView {
         let Some(anchor) = self.thread_anchor() else {
             return;
         };
-        self.show_agent_panel = true;
+        self.side_panel = Some(SidePanel::Agent);
         self.agent_panel
             .update(cx, |panel, cx| panel.new_thread(anchor, window, cx));
         cx.notify();
+    }
+
+    /// Starts a draft review comment on the selected lines of a pull request's diff.
+    fn new_draft_comment(
+        &mut self,
+        _: &NewDraftComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.pr_panel.clone() else {
+            return;
+        };
+        self.side_panel = Some(SidePanel::Review);
+        cx.notify();
+        if self.open_file.is_some() {
+            panel.update(cx, |panel, cx| {
+                panel.show_error("Comments go on lines of the pull request's diff.", cx)
+            });
+            return;
+        }
+        match self.thread_anchor().filter(|anchor| anchor.lines.is_some()) {
+            Some(anchor) => panel.update(cx, |panel, cx| panel.start_draft(anchor, window, cx)),
+            None => panel.update(cx, |panel, cx| {
+                panel.show_error(
+                    "Select the lines to comment on first (click, Shift+click to extend).",
+                    cx,
+                )
+            }),
+        }
     }
 
     fn toggle_agent_panel(
@@ -756,12 +952,13 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_agent_panel = !self.show_agent_panel;
-        if self.show_agent_panel {
+        if self.side_panel == Some(SidePanel::Agent) {
+            self.side_panel = None;
+            self.focus_handle.focus(window, cx);
+        } else {
+            self.side_panel = Some(SidePanel::Agent);
             self.agent_panel
                 .update(cx, |panel, cx| panel.focus_composer(window, cx));
-        } else {
-            self.focus_handle.focus(window, cx);
         }
         cx.notify();
     }
@@ -802,18 +999,36 @@ impl ReviewView {
         }
     }
 
-    /// Line ranges of the selected file that have a thread.
-    fn thread_ranges(&self, cx: &Context<Self>) -> Vec<(Side, u32, u32)> {
+    /// Line ranges of the file in the main pane that have a thread or a draft review
+    /// comment, with the color of their marker strip. Threads come first and win.
+    fn line_markers(&self, cx: &Context<Self>) -> Vec<LineMarker> {
         let Some(path) = self.current_path() else {
             return Vec::new();
         };
-        self.agent_panel
+        let threads = self
+            .agent_panel
             .read(cx)
             .threads()
             .iter()
             .filter(|thread| thread.anchor.path == path)
             .filter_map(|thread| thread.anchor.lines)
-            .collect()
+            .map(|(side, start, end)| (side, start, end, theme::accent()));
+        let drafts = self
+            .pr_panel
+            .as_ref()
+            .filter(|_| self.open_file.is_none())
+            .map(|panel| panel.read(cx).drafts())
+            .unwrap_or_default()
+            .iter()
+            .filter(|draft| draft.path == path)
+            .map(|draft| {
+                let side = match draft.side {
+                    DiffSide::Left => Side::Old,
+                    DiffSide::Right => Side::New,
+                };
+                (side, draft.start_line, draft.line, theme::warning())
+            });
+        threads.chain(drafts).collect()
     }
 
     /// Highlights the selected file in the background, if it isn't cached yet.
@@ -974,9 +1189,34 @@ impl ReviewView {
             .next_back()
             .map(|name| name.as_os_str().to_string_lossy().into_owned())
             .unwrap_or_default();
+        let pull_request = self
+            .pr_panel
+            .as_ref()
+            .map(|panel| panel.read(cx).checkout().pull_request.clone());
+        // A PR's worktree folder has a made-up name; show the repository's instead.
+        let repo_name = match &pull_request {
+            Some(pull_request) => pull_request.pr.slug(),
+            None => repo_name,
+        };
         header = header.child(div().font_weight(FontWeight::SEMIBOLD).child(repo_name));
         if let Some(review) = self.review() {
-            if let Some(head_label) = &review.head_label {
+            if let Some(pull_request) = &pull_request {
+                let url = pull_request.url.clone();
+                header = header.child(
+                    div()
+                        .id("pr-title")
+                        .max_w(px(420.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme::accent())
+                        .hover(|style| style.underline())
+                        .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
+                        .child(format!(
+                            "#{} {}",
+                            pull_request.pr.number, pull_request.title
+                        )),
+                );
+            } else if let Some(head_label) = &review.head_label {
                 header = header.child(div().text_color(theme::accent()).child(head_label.clone()));
             }
             let additions: usize = review.files.iter().map(|file| file.additions).sum();
@@ -1013,11 +1253,14 @@ impl ReviewView {
         } else {
             header = header.child(div().flex_1());
         }
-        header.children(self.render_update(cx)).child(
-            div()
-                .text_color(theme::muted())
-                .child("Ctrl+P file · Ctrl+Shift+F search · Alt+T thread · Alt+A agent"),
-        )
+        let shortcuts = if self.pr_panel.is_some() {
+            "Ctrl+P file · Ctrl+Shift+F search · Alt+T thread · Alt+R comment · Alt+A agent"
+        } else {
+            "Ctrl+P file · Ctrl+Shift+F search · Alt+T thread · Alt+A agent"
+        };
+        header
+            .children(self.render_update(cx))
+            .child(div().text_color(theme::muted()).child(shortcuts))
     }
 
     fn render_update(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1184,25 +1427,50 @@ impl ReviewView {
                     .border_color(theme::border())
                     .child(self.commit_input.clone()),
             )
-            .child(
+            .child({
+                let generating = self.commit_message_task.is_some();
+                let button = |id: &'static str, enabled: bool| {
+                    div()
+                        .id(id)
+                        .flex_1()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .justify_center()
+                        .when(enabled, |button| {
+                            button
+                                .cursor_pointer()
+                                .bg(theme::accent_background())
+                                .hover(|style| style.bg(theme::selection()))
+                        })
+                        .when(!enabled, |button| {
+                            button.bg(theme::hover()).text_color(theme::muted())
+                        })
+                };
                 div()
-                    .id("commit")
-                    .py_1()
-                    .rounded_md()
                     .flex()
-                    .justify_center()
-                    .when(staged > 0, |button| {
-                        button
-                            .cursor_pointer()
-                            .bg(theme::accent_background())
-                            .hover(|style| style.bg(theme::selection()))
-                            .on_click(cx.listener(|this, _, _, cx| this.commit(cx)))
-                    })
-                    .when(staged == 0, |button| {
-                        button.bg(theme::hover()).text_color(theme::muted())
-                    })
-                    .child("Commit"),
-            )
+                    .gap_2()
+                    .child(
+                        button("generate-message", staged > 0 && !generating)
+                            .when(staged > 0 && !generating, |button| {
+                                button.on_click(
+                                    cx.listener(|this, _, _, cx| this.generate_commit_message(cx)),
+                                )
+                            })
+                            .child(if generating {
+                                "Generating…"
+                            } else {
+                                "Generate message"
+                            }),
+                    )
+                    .child(
+                        button("commit", staged > 0)
+                            .when(staged > 0, |button| {
+                                button.on_click(cx.listener(|this, _, _, cx| this.commit(cx)))
+                            })
+                            .child("Commit"),
+                    )
+            })
             .when_some(self.git_status.clone(), |panel, (is_error, message)| {
                 panel.child(
                     div()
@@ -1362,7 +1630,29 @@ impl ReviewView {
                                 }))
                                 .child(thread_hint),
                         )
-                    }),
+                    })
+                    .when(
+                        self.pr_panel.is_some()
+                            && self.open_file.is_none()
+                            && self.selected_rows().is_some(),
+                        |header| {
+                            header.child(
+                                div()
+                                    .id("new-draft-comment")
+                                    .px_2()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(theme::muted())
+                                    .hover(|style| {
+                                        style.bg(theme::hover()).text_color(theme::text())
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_draft_comment(&NewDraftComment, window, cx)
+                                    }))
+                                    .child("Alt+R: comment"),
+                            )
+                        },
+                    ),
             )
             .child(
                 div()
@@ -1384,15 +1674,11 @@ impl ReviewView {
             cx.processor(|this, range: Range<usize>, _window, cx| {
                 let rows = this.rows.clone();
                 let selection = this.selected_rows().unwrap_or(0..0);
-                let thread_ranges = this.thread_ranges(cx);
+                let markers = this.line_markers(cx);
                 range
                     .map(|index| {
                         let row = &rows[index];
-                        let has_thread = thread_ranges.iter().any(|(side, start, end)| {
-                            row.line_number(*side)
-                                .is_some_and(|n| (*start..=*end).contains(&n))
-                        });
-                        render_row(row, selection.contains(&index), has_thread)
+                        render_row(row, selection.contains(&index), row.marker(&markers))
                             .id(("diff-row", index))
                             .on_click(cx.listener(move |this, event, _, cx| {
                                 this.click_row(index, event, cx)
@@ -1418,16 +1704,10 @@ impl ReviewView {
                 let rows = this.rows.clone();
                 let split_rows = this.split_rows.clone();
                 let selection = this.selected_rows().unwrap_or(0..0);
-                let thread_ranges = this.thread_ranges(cx);
-                let has_thread = |row: &Row| {
-                    thread_ranges.iter().any(|(side, start, end)| {
-                        row.line_number(*side)
-                            .is_some_and(|n| (*start..=*end).contains(&n))
-                    })
-                };
+                let markers = this.line_markers(cx);
                 range
                     .map(|split_index| match split_rows[split_index] {
-                        SplitRow::Banner(index) => render_row(&rows[index], false, false)
+                        SplitRow::Banner(index) => render_row(&rows[index], false, None)
                             .id(("split-row", split_index))
                             .into_any_element(),
                         SplitRow::Pair { left, right } => {
@@ -1445,7 +1725,7 @@ impl ReviewView {
                                     row,
                                     side,
                                     selection.contains(&index),
-                                    has_thread(row),
+                                    row.marker(&markers),
                                 )
                                 .id(("split-cell", index * 2 + side as usize))
                                 .on_click(cx.listener(move |this, event, _, cx| {
@@ -1514,7 +1794,7 @@ fn stage_checkbox(stage: StageState, index: usize, cx: &mut Context<ReviewView>)
 }
 
 /// One half of a side-by-side row: the old side (left) or the new side (right).
-fn render_split_cell(row: &Row, side: Side, selected: bool, has_thread: bool) -> gpui::Div {
+fn render_split_cell(row: &Row, side: Side, selected: bool, strip: Option<Rgba>) -> gpui::Div {
     let Row::Line {
         kind,
         old_lineno,
@@ -1554,7 +1834,7 @@ fn render_split_cell(row: &Row, side: Side, selected: bool, has_thread: bool) ->
                 .w(px(3.))
                 .h_full()
                 .flex_none()
-                .when(has_thread, |strip| strip.bg(theme::accent())),
+                .when_some(strip, |bar, color| bar.bg(color)),
         )
         .child(gutter(lineno))
         .child(
@@ -1582,7 +1862,7 @@ fn render_split_cell(row: &Row, side: Side, selected: bool, has_thread: bool) ->
         })
 }
 
-fn render_row(row: &Row, selected: bool, has_thread: bool) -> gpui::Div {
+fn render_row(row: &Row, selected: bool, strip: Option<Rgba>) -> gpui::Div {
     let base = div()
         .h(theme::ROW_HEIGHT)
         .min_w_full()
@@ -1616,12 +1896,12 @@ fn render_row(row: &Row, selected: bool, has_thread: bool) -> gpui::Div {
             base.cursor_pointer()
                 .when_some(background, |row, background| row.bg(background))
                 .child(
-                    // Thread marker strip.
+                    // Thread and draft comment marker strip.
                     div()
                         .w(px(3.))
                         .h_full()
                         .flex_none()
-                        .when(has_thread, |strip| strip.bg(theme::accent())),
+                        .when_some(strip, |bar, color| bar.bg(color)),
                 )
                 .child(gutter(*old_lineno))
                 .child(gutter(*new_lineno))
@@ -1666,11 +1946,81 @@ fn gutter(lineno: Option<u32>) -> impl IntoElement {
         .child(lineno.map(|lineno| lineno.to_string()).unwrap_or_default())
 }
 
+impl ReviewView {
+    /// The agent panel, or for a pull request, tabs switching between it and the review.
+    fn render_side_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let side_panel = self.side_panel?;
+        let Some(pr_panel) = &self.pr_panel else {
+            return Some(self.agent_panel.clone().into_any_element());
+        };
+        let drafts = pr_panel.read(cx).drafts().len();
+        let tab = |id: &'static str, label: String, panel: SidePanel| {
+            let active = side_panel == panel;
+            div()
+                .id(id)
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .when(active, |tab| tab.bg(theme::selection()))
+                .when(!active, |tab| {
+                    tab.text_color(theme::muted())
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.side_panel = Some(panel);
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        let content = match side_panel {
+            SidePanel::Agent => self.agent_panel.clone().into_any_element(),
+            SidePanel::Review => div()
+                .w(px(460.))
+                .flex_none()
+                .flex()
+                .bg(theme::panel())
+                .border_l_1()
+                .border_color(theme::border())
+                .child(pr_panel.clone())
+                .into_any_element(),
+        };
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .p_1()
+                        .flex()
+                        .gap_1()
+                        .bg(theme::panel())
+                        .border_l_1()
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .child(tab(
+                            "review-tab",
+                            match drafts {
+                                0 => "Review".to_string(),
+                                count => format!("Review · {count}"),
+                            },
+                            SidePanel::Review,
+                        ))
+                        .child(tab("agent-tab", "Agent".to_string(), SidePanel::Agent)),
+                )
+                .child(div().flex_1().min_h(px(0.)).flex().child(content))
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.state {
-            LoadState::Loading => {
-                centered(div().text_color(theme::muted()).child("Loading changes…"))
+            LoadState::Loading(message) => {
+                centered(div().text_color(theme::muted()).child(message.clone()))
             }
             LoadState::Failed(error) => {
                 centered(div().text_color(theme::error()).child(error.clone()))
@@ -1681,9 +2031,7 @@ impl Render for ReviewView {
                 .flex()
                 .child(self.render_file_list(window, cx))
                 .child(self.render_diff(window, cx))
-                .when(self.show_agent_panel, |body| {
-                    body.child(self.agent_panel.clone())
-                })
+                .children(self.render_side_panel(cx))
                 .into_any_element(),
         };
         div()
@@ -1693,6 +2041,7 @@ impl Render for ReviewView {
             .on_action(cx.listener(|this, _: &PreviousFile, _, cx| this.select_relative(-1, cx)))
             .on_action(cx.listener(|this, _: &Reload, _, cx| this.reload(cx)))
             .on_action(cx.listener(Self::new_thread))
+            .on_action(cx.listener(Self::new_draft_comment))
             .on_action(cx.listener(Self::toggle_agent_panel))
             .on_action(cx.listener(Self::toggle_split))
             .on_action(cx.listener(Self::toggle_selected_stage))

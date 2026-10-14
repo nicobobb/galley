@@ -5,7 +5,7 @@
 mod git_cli;
 mod watch;
 
-pub use git_cli::{commit, stage, unstage};
+pub use git_cli::{commit, git, recent_subjects, stage, staged_diff, unstage};
 pub use watch::RepoWatcher;
 
 use std::collections::HashMap;

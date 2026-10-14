@@ -41,7 +41,7 @@ pub struct ThreadAnchor {
 }
 
 impl ThreadAnchor {
-    fn lines_label(&self) -> Option<String> {
+    pub fn lines_label(&self) -> Option<String> {
         let (side, start, end) = self.lines?;
         let side = match side {
             Side::Old => " (old version)",
